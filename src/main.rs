@@ -115,7 +115,7 @@ fn get_json_from_stream(stream : &mut TcpStream) -> JsonValue {
     }
 }
 
-fn handle_ping_cmd(config: &JsonValue, stream: &mut TcpStream) {
+fn handle_ping_cmd(_config: &JsonValue, stream: &mut TcpStream) {
     log!("Handling ping command");
     
     // PING command does not require a key
@@ -269,6 +269,14 @@ fn handle_file_write_cmd(config: &JsonValue, stream: &mut TcpStream) {
 
 fn handle_file_execute_cmd(config: &JsonValue, stream: &mut TcpStream) {
     log!("Handling file execute command");
+
+    if config["properties"]["file_execute"] != true {
+        log!("execution disabled, ignoring request");
+        return;
+    }
+
+    // get command json
+    
 }
 
 fn handle_incoming_stream(config: &JsonValue, stream : &mut TcpStream) {
@@ -395,7 +403,7 @@ fn handle_client_write(args: &Vec<String>, config : &JsonValue) {
     match client_connect(config) {
         Ok(mut stream) => {
             if stream.write(&[MAGIC0, MAGIC1, CMD_FWRITE]).is_ok_and(|_| client_send_key(config, &mut stream).is_ok()) {
-                let mut json_string_len = [
+                let json_string_len = [
                     ((json_string.as_bytes().len() >> 0) & 0xFF) as u8,
                     ((json_string.as_bytes().len() >> 8) & 0xFF) as u8,
                     ((json_string.as_bytes().len() >> 16) & 0xFF) as u8,
@@ -504,7 +512,7 @@ fn handle_client_read(args: &Vec<String>, config : &JsonValue) {
             let mut file_raw = match File::options().write(true).create(true).truncate(true).open(format!("{local_destination_file}.raw.json")) {
                 Ok(file) => file,
                 Err(why) => {
-                    log!("Failed to open {local_destination_file}.raw.json for writing!");
+                    log!("Failed to open {local_destination_file}.raw.json for writing: {why}");
                     return;
                 }
             };
@@ -552,7 +560,7 @@ fn handle_client_read(args: &Vec<String>, config : &JsonValue) {
             let _ = file.write(&data);
         },
         Err(why) => {
-            log!("Failed to open stream to host.");
+            log!("Failed to open stream to host: {why}");
             return;
         }
     }
@@ -563,9 +571,70 @@ fn handle_client_execute(args: &Vec<String>, config : &JsonValue) {
         print_client_usages();
         return;
     }
+
+    let local_test_plan_path = &args[2];
+
+    let mut file_to_read = match File::open(&local_test_plan_path) {
+        Ok(file) => file,
+        Err(why) => {
+            log!("{local_test_plan_path}: {why}");
+            return;
+        }
+    };
+
+    let mut file_transfer_json = String::new();
+    match file_to_read.read_to_string(&mut file_transfer_json) {
+        Ok(_) => (),
+        Err(why) => {
+            log!("{local_test_plan_path}: {why}");
+            return;
+        }
+    }
+    
+    let debug_string = json::stringify_pretty(json::from(file_transfer_json), 4);
+    log!("{debug_string}");
+
+    let json_to_send = &debug_string;
+
+    let mut results : Vec<u8> = vec![];
+    if client_connect(config).is_ok_and(|mut stream| 
+        stream.write(&[MAGIC0, MAGIC1, CMD_FEXE]).is_ok_and(|_| 
+            client_send_key(config, &mut stream).is_ok_and(|_| {
+                let ft_json_len = [
+                    ((json_to_send.as_bytes().len() >> 0) & 0xFF) as u8,
+                    ((json_to_send.as_bytes().len() >> 8) & 0xFF) as u8,
+                    ((json_to_send.as_bytes().len() >> 16) & 0xFF) as u8,
+                    ((json_to_send.as_bytes().len() >> 24) & 0xFF) as u8
+                ];
+                stream.write(&ft_json_len).is_ok_and(|_| 
+                    stream.write(json_to_send.as_bytes()).is_ok_and(|_| {
+                        let mut ack_seq = ACK_SEQUENCE.clone();
+                        if stream.read_exact(&mut ack_seq).is_ok_and(|_| ack_seq == ACK_SEQUENCE) {
+                            let mut resp_len = [0u8; 4];
+                            stream.read_exact(&mut resp_len).is_ok_and(|_| {
+                                let resp_len_usize = (resp_len[0] as usize) |
+                                                            (resp_len[1] as usize) << 8 |
+                                                            (resp_len[2] as usize) << 16 |
+                                                            (resp_len[3] as usize) << 24;                            
+                                results = vec![0u8; resp_len_usize];
+                                stream.read_exact(&mut results).is_ok()
+                            })
+                        } else {
+                            false
+                        }
+                }))
+    }))) {
+        let _ = std::io::stdout().write(&results);
+        let _ = std::io::stdout().write("\n".as_bytes());
+        let _ = std::io::stdout().flush();
+    } else {
+        log!("Failed to execute remote test on agent.");
+    }
+
+
 }
 
-fn handle_client_ping(args: &Vec<String>, config : &JsonValue) {
+fn handle_client_ping(_args: &Vec<String>, config : &JsonValue) {
     let ping_command = [MAGIC0, MAGIC1, CMD_PING];
 
     match client_connect(config) {
@@ -602,7 +671,7 @@ fn print_client_usages() {
     println!("No parameters: start a server using {CONFIG_PATH} settings.");
     println!("-w local_source_file remote_destination_file [{CONFIG_PATH} is used for target server] | write a file");
     println!("-r remote_source_file local_destination_file [{CONFIG_PATH} is used for target server] | read a file");
-    println!("-x remote_file [{CONFIG_PATH} is used for target server] | execute a script");
+    println!("-x local_test_plan.json [{CONFIG_PATH} is used for target server] | execute a test plan");
     println!("-p [{CONFIG_PATH} is used for target server] | ping the server")
 }
 
@@ -614,7 +683,7 @@ fn main() {
     let config;
 
     let opt_file = File::open(path);
-    let mut run = true;
+    let run = true;
 
      match opt_file {
         Err(why) => {
