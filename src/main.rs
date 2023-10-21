@@ -1,5 +1,4 @@
 
-use std::any::type_name;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
@@ -205,6 +204,67 @@ fn handle_file_read_cmd(config: &JsonValue, stream: &mut TcpStream) {
 
 fn handle_file_write_cmd(config: &JsonValue, stream: &mut TcpStream) {
     log!("Handling file write command");
+
+    if config["properties"]["file_write"] != true {
+        log!("Write request denied: write permission is disabled.");
+        return;
+    }
+
+    match validate_key(get_key_type(config), &String::from(config["net_config"]["key"].as_str().unwrap()), stream) {
+        true => {
+            let request = get_json_from_stream(stream);
+            // test for expected parameters
+            if request["path"] == json::Null {
+                let _ = stream.write(&NACK_SEQUENCE);
+            } else {
+                let file_path = request["path"].to_string();
+                let file_data = match &request["data"] {
+                    JsonValue::Array(data_array) => {
+                        let mut data: Vec<u8> = vec![];
+                        for e in data_array {
+                            match e {
+                                JsonValue::Number(json_number) => data.push(json_number.to_string().parse::<i64>().unwrap() as u8),
+                                _ => log!("Invalid array element type {e}"),
+                            }
+                        }
+
+                        data
+                    },
+                    JsonValue::String(raw_string) => {
+                        raw_string.as_bytes().to_vec()
+                    },
+                    _ => {
+                        log!("Unsupported data type");
+                        let _ = stream.write(&NACK_SEQUENCE);
+                        return;
+                    }
+                };
+
+                let mut file_to_write = match File::options().write(true).create(true).truncate(true).open(&file_path) {
+                    Ok(file) => file,
+                    Err(why) => {
+                        log!("{file_path}: {why}");
+                        let _ = stream.write(&NACK_SEQUENCE);
+                        return;
+                    }
+                };
+
+                let _ = match file_to_write.write(&file_data) {
+                    Ok(_) => stream.write(&ACK_SEQUENCE),
+                    Err(why) => {
+                        log!("File write failed: {why}");
+                        stream.write(&NACK_SEQUENCE)
+                    }
+                };
+
+                log!("Successfully wrote {file_path}");
+            }
+        },
+
+        false => {
+            let _ = stream.write(&NACK_SEQUENCE);
+        }
+    }
 }
 
 fn handle_file_execute_cmd(config: &JsonValue, stream: &mut TcpStream) {
@@ -303,6 +363,62 @@ fn handle_client_write(args: &Vec<String>, config : &JsonValue) {
     if args.len() != 4 {
         print_client_usages();
         return;
+    }
+
+    let local_source_file = &args[2];
+    let remote_destination_file = &args[3];
+
+    let mut file_to_read = match File::open(&local_source_file) {
+        Ok(file) => file,
+        Err(why) => {
+            log!("{local_source_file}: {why}");
+            return;
+        }
+    };
+
+    let mut file_data = String::new();
+    match file_to_read.read_to_string(&mut file_data) {
+        Ok(_) => (),
+        Err(why) => {
+            log!("{local_source_file}: {why}");
+            return;
+        }
+    }
+
+    let file_transfer_json = json::object!{
+        path: remote_destination_file.as_str(),
+        data: file_data.as_bytes()
+    };
+
+    let json_string = json::stringify(file_transfer_json);
+
+    match client_connect(config) {
+        Ok(mut stream) => {
+            if stream.write(&[MAGIC0, MAGIC1, CMD_FWRITE]).is_ok_and(|_| client_send_key(config, &mut stream).is_ok()) {
+                let mut json_string_len = [
+                    ((json_string.as_bytes().len() >> 0) & 0xFF) as u8,
+                    ((json_string.as_bytes().len() >> 8) & 0xFF) as u8,
+                    ((json_string.as_bytes().len() >> 16) & 0xFF) as u8,
+                    ((json_string.as_bytes().len() >> 24) & 0xFF) as u8
+                ];
+
+                if stream.write(&json_string_len).is_ok_and(|_| stream.write(json_string.as_bytes()).is_ok()) {
+                    let mut ack_seq = [0u8; ACK_SEQUENCE.len()];
+                    if stream.read_exact(&mut ack_seq).is_ok_and(|_| ack_seq == ACK_SEQUENCE) {
+                        log!("File write completed successfully.");
+                    } else {
+                        log!("File write failed!");
+                    }
+                } else {
+                    log!("File write failed!");
+                }
+            } else {
+                log!("Failed to send file write command!");
+            }
+        },
+        Err(why) => {
+            log!("Failed to connect to server: {why}");
+        }
     }
 }
 
